@@ -1,0 +1,229 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum Role {
+  VIEWER
+  SCORER
+  ADMIN
+}
+
+model User {
+  id                     String                  @id @default(uuid())
+  email                  String                  @unique
+  passwordHash           String
+  name                   String
+  role                   Role                    @default(VIEWER)
+  createdAt              DateTime                @default(now())
+  updatedAt              DateTime                @updatedAt
+  sessions               Session[]
+  metricScores           MetricScore[]
+  maturityRatings        MaturityRating[]
+  projectMetricSnapshots ProjectMetricSnapshot[]
+  auditLogs              AuditLog[]
+
+  @@map("users")
+}
+
+/// Tracks issued JWTs so a session can be revoked (logout / security incident)
+/// without waiting for natural token expiry.
+model Session {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String
+  createdAt DateTime  @default(now())
+  expiresAt DateTime
+  revokedAt DateTime?
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+enum ClientStatus {
+  ACTIVE
+  INACTIVE
+}
+
+model Client {
+  id                     String                  @id @default(uuid())
+  name                   String
+  status                 ClientStatus            @default(ACTIVE)
+  contactEmail           String?
+  accountManager         String?
+  onboardedAt            DateTime?
+  createdAt              DateTime                @default(now())
+  updatedAt              DateTime                @updatedAt
+  metricScores           MetricScore[]
+  maturityRatings        MaturityRating[]
+  projectMetricSnapshots ProjectMetricSnapshot[]
+  integrationConfig      IntegrationConfig?
+  auditLogs              AuditLog[]
+
+  @@map("clients")
+}
+
+enum BenchmarkDirection {
+  /// Higher measurement is better; benchmarkValue is a floor (e.g. "≥ 95%").
+  AT_LEAST
+  /// Lower measurement is better; benchmarkValue is a ceiling (e.g. "≤ 0.1").
+  AT_MOST
+}
+
+/// The 7 quantitative metrics from the scoring-model doc, seeded once and
+/// read-only from the app's perspective. Weights must sum to 100% across all
+/// rows — the composite/departmental formulas (Epic 2) depend on that.
+///
+/// benchmarkValue/benchmarkDirection encode the free-text targetBenchmark as
+/// numbers the formula engine can compare against — e.g. "≥ 95% capacity
+/// utilization" becomes { benchmarkValue: 0.95, benchmarkDirection: AT_LEAST }.
+model EvaluationCategory {
+  id                 String             @id @default(uuid())
+  name               String             @unique
+  metricKpi          String
+  measurementFormula String
+  targetBenchmark    String
+  benchmarkValue     Float
+  benchmarkDirection BenchmarkDirection
+  weight             Float
+  sortOrder          Int                @unique
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+  metricScores       MetricScore[]
+
+  @@map("evaluation_categories")
+}
+
+/// Append-only audit trail of scored measurements — never updated in place,
+/// so a disputed score can always be traced to exactly which input produced
+/// it and when (per the source plan's cross-cutting audit-trail note).
+/// weightSnapshot freezes the category's weight at scoring time so a later
+/// weight change doesn't retroactively alter historical scores.
+model MetricScore {
+  id                   String             @id @default(uuid())
+  clientId             String
+  client               Client             @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  evaluationCategoryId String
+  evaluationCategory   EvaluationCategory @relation(fields: [evaluationCategoryId], references: [id])
+  period               DateTime           @default(now())
+  rawMeasurement       Float
+  computedScore        Int
+  weightSnapshot       Float
+  scoredById           String
+  scoredBy             User               @relation(fields: [scoredById], references: [id])
+  createdAt            DateTime           @default(now())
+
+  @@index([clientId, evaluationCategoryId, createdAt])
+  @@map("metric_scores")
+}
+
+/// The 3 qualitative dimensions are fixed rubric content (see
+/// src/constants/qualitative-dimensions.ts) with no per-client configurable
+/// parameters, unlike EvaluationCategory — so no reference table for them,
+/// just this enum plus the rating itself.
+enum MaturityDimension {
+  SYSTEM_ADOPTION
+  DATA_PRIVACY_COMPLIANCE
+  CHANGE_MANAGEMENT_ONBOARDING
+}
+
+/// Append-only, same audit-trail rationale as MetricScore. level is always
+/// 1, 3, or 5 (enforced at the application layer, not the DB, since Prisma
+/// has no native check-constraint shorthand for Postgres).
+model MaturityRating {
+  id        String            @id @default(uuid())
+  clientId  String
+  client    Client            @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  dimension MaturityDimension
+  level     Int
+  notes     String?
+  ratedById String
+  ratedBy   User              @relation(fields: [ratedById], references: [id])
+  createdAt DateTime          @default(now())
+
+  @@index([clientId, dimension, createdAt])
+  @@map("maturity_ratings")
+}
+
+/// Append-only, same audit-trail rationale as MetricScore/MaturityRating.
+/// spi/cpi/scorecardPoints are computed at write time and stored (not
+/// recomputed on every read) — cheap here since a snapshot is written once,
+/// read many times for history/dashboard views.
+///
+/// resourceUtilization ("bench time") and its 20/10 point bands are a
+/// placeholder pending the real metric definition from the source doc —
+/// see health.service.ts.
+model ProjectMetricSnapshot {
+  id                  String   @id @default(uuid())
+  clientId            String
+  client              Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  period              DateTime @default(now())
+  pv                  Float
+  ac                  Float
+  ev                  Float
+  clientSignoff       Boolean
+  resourceUtilization Float
+  spi                 Float
+  cpi                 Float
+  scorecardPoints     Int
+  enteredById         String
+  enteredBy           User     @relation(fields: [enteredById], references: [id])
+  createdAt           DateTime @default(now())
+
+  @@index([clientId, createdAt])
+  @@map("project_metric_snapshots")
+}
+
+enum IntegrationProvider {
+  JIRA
+  ASANA
+}
+
+enum SyncStatus {
+  SUCCESS
+  FAILED
+  SYNCING
+}
+
+model IntegrationConfig {
+  id               String              @id @default(uuid())
+  clientId         String              @unique
+  client           Client              @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  provider         IntegrationProvider
+  accessToken      String
+  refreshToken     String?
+  tokenExpiresAt   DateTime?
+  jiraProjectKey   String?             // For Jira mapping
+  asanaWorkspaceId String?             // For Asana mapping
+  pvField          String              // e.g. "customfield_1001" or "story_points"
+  acField          String
+  evField          String
+  lastSyncStatus   SyncStatus?
+  lastSyncError    String?
+  lastSyncedAt     DateTime?
+  createdAt        DateTime            @default(now())
+  updatedAt        DateTime            @updatedAt
+
+  @@map("integration_configs")
+}
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  clientId  String?
+  client    Client?  @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  action    String   // e.g. "CLIENT_CREATE", "METRIC_SCORE_UPDATE", "MATURITY_RATING_UPDATE", "HEALTH_SNAPSHOT_SUBMIT"
+  details   String   // JSON string storing details: { oldValue, newValue, description }
+  createdAt DateTime @default(now())
+
+  @@index([clientId, createdAt])
+  @@map("audit_logs")
+}
+
